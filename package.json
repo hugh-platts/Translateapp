@@ -1,7 +1,7 @@
 {
-  "name": "video-translation-app",
+  "name": "video-translation-app-v2",
   "version": "1.0.0",
-  "description": "Video call app with real-time translation",
+  "description": "Video call app with real-time translation and call controls",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
