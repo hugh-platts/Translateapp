@@ -18,6 +18,7 @@ let peerConnection;
 let myLanguage = '';
 let targetLanguage = '';
 const roomId = 'main-room'; // Static room for simplicity
+let isRecognitionActive = false;
 
 // WebRTC server configuration
 const servers = {
@@ -32,8 +33,8 @@ const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecogni
 let recognition;
 if (SpeechRecognition) {
     recognition = new SpeechRecognition();
-    recognition.continuous = true; // Keep listening
-    recognition.interimResults = false;
+    recognition.continuous = true; 
+    recognition.interimResults = true; // Get results faster
 } else {
     showError("Speech Recognition API is not supported in this browser.");
 }
@@ -78,6 +79,7 @@ function addCaption(mainText, subText, isLocal) {
 
 // ---- TRANSLATION ----
 async function translateText(text, source, target) {
+    if (!text) return null;
     const langPair = `${source}|${target}`;
     const apiUrl = `https://api.mymemory.translated.net/get?q=${encodeURIComponent(text)}&langpair=${langPair}`;
     try {
@@ -90,58 +92,70 @@ async function translateText(text, source, target) {
         throw new Error("No translation found.");
     } catch (error) {
         console.error("Translation failed:", error);
-        // Don't show modal for every failed translation, just log it.
-        return null;
+        return `Translation failed for: ${text}`;
     }
 }
 
 
 // ---- SPEECH RECOGNITION LOGIC ----
 function startRecognition() {
-    if (!recognition || !myLanguage) return;
+    if (!recognition || !myLanguage || isRecognitionActive) return;
     
+    isRecognitionActive = true;
     recognition.lang = myLanguage === 'en' ? 'en-US' : 'ja-JP';
     
-    recognition.onresult = async (event) => {
-        const lastResult = event.results[event.results.length - 1];
-        if(lastResult.isFinal) {
-            const spokenText = lastResult[0].transcript.trim();
-            if (spokenText) {
-                console.log('Recognized:', spokenText);
-                const translatedText = await translateText(spokenText, myLanguage, targetLanguage);
-                if (translatedText) {
-                    // Display locally
-                    addCaption(spokenText, translatedText, true);
-                    // Send to remote peer
-                    socket.emit('send-caption', {
-                        original: spokenText,
-                        translated: translatedText
-                    });
-                }
+    recognition.onresult = (event) => {
+        let finalTranscript = '';
+        for (let i = event.resultIndex; i < event.results.length; ++i) {
+            if (event.results[i].isFinal) {
+                finalTranscript += event.results[i][0].transcript;
             }
+        }
+        
+        if (finalTranscript) {
+            handleSpokenText(finalTranscript.trim());
         }
     };
     
     recognition.onend = () => {
-        // Restart recognition if it stops for any reason
-        console.log('Speech recognition ended, restarting...');
-        if(peerConnection) { // Only restart if call is active
-           setTimeout(() => recognition.start(), 500);
+        console.log('Speech recognition service disconnected.');
+        // If the call is still active, restart recognition.
+        if (peerConnection && peerConnection.connectionState === 'connected') {
+            console.log('Restarting recognition...');
+            recognition.start();
+        } else {
+            isRecognitionActive = false;
         }
     };
 
     recognition.onerror = (event) => {
         console.error(`Speech recognition error: ${event.error}`);
-        if(event.error === 'no-speech' || event.error === 'network'){
-            // These are common and we don't want to stop. The onend handler will restart it.
-        } else {
-            showError(`Speech recognition failed: ${event.error}. It might not work correctly.`);
-        }
+        // The 'onend' event will fire after an error, which will handle restarting.
     };
-
-    recognition.start();
-    console.log(`Speech recognition started for ${recognition.lang}`);
+    
+    try {
+        recognition.start();
+        console.log(`Speech recognition started for ${recognition.lang}`);
+    } catch(e) {
+        console.error("Could not start recognition: ", e);
+        isRecognitionActive = false;
+    }
 }
+
+async function handleSpokenText(spokenText) {
+    console.log('Recognized (final):', spokenText);
+    const translatedText = await translateText(spokenText, myLanguage, targetLanguage);
+    if (translatedText) {
+        // Display locally
+        addCaption(spokenText, translatedText, true);
+        // Send to remote peer
+        socket.emit('send-caption', {
+            original: spokenText,
+            translated: translatedText
+        });
+    }
+}
+
 
 // ---- WEBRTC & SOCKET.IO LOGIC ----
 async function start() {
@@ -191,7 +205,7 @@ socket.on('offer', (payload) => {
     console.log('Received offer from', payload.caller);
     updateStatus('Incoming call. Answering...');
     createPeerConnection(payload.caller);
-    peerConnection.setRemoteDescription(payload.sdp)
+    peerConnection.setRemoteDescription(new RTCSessionDescription(payload.sdp))
         .then(() => peerConnection.createAnswer())
         .then(answer => peerConnection.setLocalDescription(answer))
         .then(() => {
@@ -206,12 +220,12 @@ socket.on('offer', (payload) => {
 
 socket.on('answer', (payload) => {
     console.log('Received answer from', payload.caller);
-    updateStatus('Connection established!');
-    peerConnection.setRemoteDescription(payload.sdp);
+    peerConnection.setRemoteDescription(new RTCSessionDescription(payload.sdp)).catch(e => console.error(e));
 });
 
 socket.on('ice-candidate', (payload) => {
-    peerConnection.addIceCandidate(new RTCIceCandidate(payload.ice));
+    peerConnection.addIceCandidate(new RTCIceCandidate(payload.ice))
+      .catch(e => console.error("Error adding received ice candidate", e));
 });
 
 socket.on('new-caption', (captionData) => {
@@ -226,8 +240,9 @@ socket.on('user-left', (socketId) => {
         peerConnection.close();
         peerConnection = null;
     }
-    if(recognition){
+    if(recognition && isRecognitionActive){
         recognition.stop();
+        isRecognitionActive = false;
     }
 });
 
@@ -250,7 +265,14 @@ function createPeerConnection(partnerSocketId) {
     };
 
     peerConnection.ontrack = (event) => {
-        remoteVideo.srcObject = event.streams[0];
+        // When the remote video track is received, add it to the video element
+        if (event.streams && event.streams[0]) {
+            remoteVideo.srcObject = event.streams[0];
+        } else {
+            // Fallback for older browsers
+            let inboundStream = new MediaStream(event.track);
+            remoteVideo.srcObject = inboundStream;
+        }
         updateStatus(''); // Clear status once video is streaming
     };
     
