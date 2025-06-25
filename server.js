@@ -7,11 +7,7 @@ const socketIo = require('socket.io');
 
 const app = express();
 const server = http.createServer(app);
-const io = new socketIo.Server(server, {
-    cors: {
-        origin: "*", // Allow all origins for simplicity, restrict in production
-    }
-});
+const io = new socketIo.Server(server);
 
 // Serve the public directory for the frontend
 app.use(express.static('public'));
@@ -46,24 +42,22 @@ io.on('connection', (socket) => {
         // Send language assignment to the newly joined user
         socket.emit('language-assigned', userLang);
 
-        // If another user is already in the room, notify them
+        // Notify the other user in the room that someone has joined
         const otherUser = rooms[roomId].find(id => id !== socket.id);
         if (otherUser) {
             socket.to(otherUser).emit('user-joined', { peerId: socket.id });
+             // Also notify the new user about the existing user
+            socket.emit('user-joined', { peerId: otherUser });
         }
     });
 
-    // Handle WebRTC signaling: offer, answer, ice-candidate
-    socket.on('offer', (payload) => {
-        io.to(payload.target).emit('offer', { sdp: payload.sdp, caller: socket.id });
-    });
-
-    socket.on('answer', (payload) => {
-        io.to(payload.target).emit('answer', { sdp: payload.sdp });
-    });
-
-    socket.on('ice-candidate', (payload) => {
-        io.to(payload.target).emit('ice-candidate', { candidate: payload.candidate });
+    // A unified 'signal' event to relay all WebRTC messages
+    socket.on('signal', (payload) => {
+        io.to(payload.target).emit('signal', {
+            sender: socket.id,
+            type: payload.type,
+            data: payload.data
+        });
     });
 
     // Relay caption data to the other user in the room
@@ -75,12 +69,7 @@ io.on('connection', (socket) => {
         }
     });
     
-    // Handle call ending
-    socket.on('end-call', () => {
-        handleDisconnect(socket);
-    });
-
-    // Handle user disconnection
+    // Handle user disconnection via end-call or browser close
     socket.on('disconnect', () => {
         handleDisconnect(socket);
     });
