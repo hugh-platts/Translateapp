@@ -21,6 +21,7 @@ let targetLanguage = '';
 let isRecognitionActive = false;
 let currentVideoDeviceIndex = 0;
 let videoDevices = [];
+let remotePeerId;
 const roomId = 'main-room';
 
 // WebRTC server configuration
@@ -83,10 +84,12 @@ async function startLocalMedia() {
 }
 
 async function getConnectedDevices() {
-    const devices = await navigator.mediaDevices.enumerateDevices();
-    videoDevices = devices.filter(device => device.kind === 'videoinput');
-    if (videoDevices.length > 1) {
-        switchCameraBtn.disabled = false;
+    try {
+        const devices = await navigator.mediaDevices.enumerateDevices();
+        videoDevices = devices.filter(device => device.kind === 'videoinput');
+        switchCameraBtn.disabled = videoDevices.length < 2;
+    } catch(e) {
+        console.error("Could not enumerate devices:", e);
     }
 }
 
@@ -95,23 +98,21 @@ async function switchCamera() {
     currentVideoDeviceIndex = (currentVideoDeviceIndex + 1) % videoDevices.length;
     const deviceId = videoDevices[currentVideoDeviceIndex].deviceId;
 
-    // Get new stream
     const newStream = await navigator.mediaDevices.getUserMedia({
         video: { deviceId: { exact: deviceId } },
-        audio: true,
+        audio: true, 
     });
 
-    // Replace video track in local stream and peer connection
     const newVideoTrack = newStream.getVideoTracks()[0];
-    const sender = peerConnection.getSenders().find(s => s.track.kind === 'video');
+    const sender = peerConnection?.getSenders().find(s => s.track.kind === 'video');
     if (sender) {
         sender.replaceTrack(newVideoTrack);
     }
     
-    // Update local video element
+    localStream.getVideoTracks()[0].stop();
     localStream.removeTrack(localStream.getVideoTracks()[0]);
     localStream.addTrack(newVideoTrack);
-    localVideo.srcObject = localStream; // Re-assigning might be needed for some browsers
+    localVideo.srcObject = localStream; 
 }
 
 
@@ -130,8 +131,8 @@ function startRecognition() {
     };
     
     recognition.onend = () => {
-        if (isRecognitionActive) { // Only restart if we want it to be active
-            recognition.start();
+        if (isRecognitionActive) { 
+            setTimeout(() => recognition.start(), 100); 
         }
     };
     recognition.start();
@@ -159,7 +160,7 @@ async function translateText(text, source, target) {
     try {
         const res = await fetch(url);
         const data = await res.json();
-        return data.responseData.translatedText;
+        return data.responseData?.translatedText || text;
     } catch (e) {
         console.error("Translation failed:", e);
         return null;
@@ -168,7 +169,11 @@ async function translateText(text, source, target) {
 
 // --- WEBRTC & SOCKET.IO LOGIC ---
 function joinCall() {
-    showStatus('Connecting...');
+    if (!localStream) {
+        alert("Cannot join call without access to camera and microphone.");
+        return;
+    }
+    showStatus('Waiting for another user...');
     socket.emit('join-room', roomId);
 }
 
@@ -177,16 +182,10 @@ function endCall() {
         peerConnection.close();
         peerConnection = null;
     }
-    if (localStream) {
-        localStream.getTracks().forEach(track => track.stop());
-        localStream = null;
-    }
     remoteVideo.srcObject = null;
     captionOverlay.innerHTML = '';
     stopRecognition();
-    socket.emit('end-call');
     showJoinUI('Call Ended');
-    startLocalMedia(); // Restart to show preview for next call
 }
 
 function createPeerConnection() {
@@ -195,60 +194,83 @@ function createPeerConnection() {
     localStream.getTracks().forEach(track => peerConnection.addTrack(track, localStream));
 
     peerConnection.ontrack = event => {
-        remoteVideo.srcObject = event.streams[0];
+        if (event.streams && event.streams[0]) {
+            remoteVideo.srcObject = event.streams[0];
+        }
     };
 
     peerConnection.onicecandidate = event => {
         if (event.candidate) {
-            socket.emit('ice-candidate', { target: remotePeerId, candidate: event.candidate });
+            socket.emit('signal', {
+                target: remotePeerId,
+                type: 'ice-candidate',
+                data: event.candidate
+            });
         }
     };
 
     peerConnection.onconnectionstatechange = () => {
-        if (peerConnection.connectionState === 'connected') {
-            hideOverlay();
-            startRecognition();
+        console.log("Connection State:", peerConnection.connectionState);
+        switch(peerConnection.connectionState) {
+            case "connected":
+                hideOverlay();
+                startRecognition();
+                break;
+            case "disconnected":
+            case "closed":
+            case "failed":
+                endCall();
+                showJoinUI('User has left');
+                break;
         }
     };
 }
 
-let remotePeerId;
-
-// Socket Event Listeners
+// --- SOCKET EVENT LISTENERS ---
 socket.on('language-assigned', lang => {
     myLanguage = lang;
     targetLanguage = myLanguage === 'en' ? 'ja' : 'en';
 });
 
-socket.on('room-full', () => showStatus('Room is full.'));
+socket.on('room-full', () => showStatus('Room is full. Please try again later.'));
 
-socket.on('user-joined', ({ peerId }) => {
+socket.on('user-joined', async ({ peerId }) => {
     remotePeerId = peerId;
+    showStatus('User found. Connecting...');
     createPeerConnection();
-    peerConnection.createOffer()
-        .then(offer => peerConnection.setLocalDescription(offer))
-        .then(() => {
-            socket.emit('offer', { target: remotePeerId, sdp: peerConnection.localDescription });
+    // The first user to join ('en') will create the offer
+    if (myLanguage === 'en') {
+        const offer = await peerConnection.createOffer();
+        await peerConnection.setLocalDescription(offer);
+        socket.emit('signal', {
+            target: remotePeerId,
+            type: 'offer',
+            data: offer
         });
+    }
 });
 
-socket.on('offer', ({ sdp, caller }) => {
-    remotePeerId = caller;
-    createPeerConnection();
-    peerConnection.setRemoteDescription(new RTCSessionDescription(sdp))
-        .then(() => peerConnection.createAnswer())
-        .then(answer => peerConnection.setLocalDescription(answer))
-        .then(() => {
-            socket.emit('answer', { target: remotePeerId, sdp: peerConnection.localDescription });
+socket.on('signal', async ({ sender, type, data }) => {
+    remotePeerId = sender; // Always update remotePeerId from the sender
+    if (type === 'offer') {
+        if (!peerConnection) createPeerConnection();
+        await peerConnection.setRemoteDescription(new RTCSessionDescription(data));
+        const answer = await peerConnection.createAnswer();
+        await peerConnection.setLocalDescription(answer);
+        socket.emit('signal', {
+            target: remotePeerId,
+            type: 'answer',
+            data: answer
         });
-});
-
-socket.on('answer', ({ sdp }) => {
-    peerConnection.setRemoteDescription(new RTCSessionDescription(sdp));
-});
-
-socket.on('ice-candidate', ({ candidate }) => {
-    peerConnection.addIceCandidate(new RTCIceCandidate(candidate));
+    } else if (type === 'answer') {
+        if (peerConnection) {
+            await peerConnection.setRemoteDescription(new RTCSessionDescription(data));
+        }
+    } else if (type === 'ice-candidate') {
+        if (peerConnection) {
+            await peerConnection.addIceCandidate(new RTCIceCandidate(data));
+        }
+    }
 });
 
 socket.on('new-caption', captionData => {
@@ -256,12 +278,14 @@ socket.on('new-caption', captionData => {
 });
 
 socket.on('user-left', () => {
-    showJoinUI('Other user has left');
     endCall();
 });
 
-// Initial Setup
+// --- INITIAL SETUP ---
 joinBtn.addEventListener('click', joinCall);
-endCallBtn.addEventListener('click', endCall);
+endCallBtn.addEventListener('click', () => {
+    socket.disconnect(); // This triggers 'disconnect' on server
+    endCall();
+});
 switchCameraBtn.addEventListener('click', switchCamera);
 window.addEventListener('load', startLocalMedia);
