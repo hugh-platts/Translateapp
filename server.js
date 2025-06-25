@@ -7,83 +7,102 @@ const socketIo = require('socket.io');
 
 const app = express();
 const server = http.createServer(app);
-const io = new socketIo.Server(server);
+const io = new socketIo.Server(server, {
+    cors: {
+        origin: "*", // Allow all origins for simplicity, restrict in production
+    }
+});
 
 // Serve the public directory for the frontend
 app.use(express.static('public'));
 
-let roomUsers = {}; // Object to store users in the room
+let rooms = {}; // Object to store room information
 
 io.on('connection', (socket) => {
     console.log('A user connected:', socket.id);
 
-    // Event for a user to join the room
     socket.on('join-room', (roomId) => {
-        // For simplicity, we'll use a single room 'main-room'
-        const room = 'main-room';
-        
         // Initialize room if it doesn't exist
-        if (!roomUsers[room]) {
-            roomUsers[room] = [];
+        if (!rooms[roomId]) {
+            rooms[roomId] = [];
         }
         
-        // Assign language based on who joins first
-        let userLang = 'en'; // Default to English
-        if (roomUsers[room].length === 1) {
-            userLang = 'ja'; // Second user is Japanese
-        } else if (roomUsers[room].length >= 2) {
-            // Room is full
+        // Prevent more than two users from joining
+        if (rooms[roomId].length >= 2) {
             socket.emit('room-full');
             return;
         }
 
-        socket.join(room);
-        roomUsers[room].push({ id: socket.id, lang: userLang });
-        socket.data.lang = userLang; // Store lang in socket data
-        socket.data.room = room; // Store room in socket data
+        // Assign language based on who joins first
+        const userLang = rooms[roomId].length === 0 ? 'en' : 'ja';
 
-        console.log(`User ${socket.id} joined room ${room} as ${userLang}`);
+        socket.join(roomId);
+        rooms[roomId].push(socket.id);
+        socket.data.roomId = roomId;
+        socket.data.lang = userLang;
+
+        console.log(`User ${socket.id} joined room ${roomId} as ${userLang}`);
 
         // Send language assignment to the newly joined user
         socket.emit('language-assigned', userLang);
 
-        // Notify other user in the room
-        socket.to(room).emit('user-joined', socket.id);
+        // If another user is already in the room, notify them
+        const otherUser = rooms[roomId].find(id => id !== socket.id);
+        if (otherUser) {
+            socket.to(otherUser).emit('user-joined', { peerId: socket.id });
+        }
     });
 
     // Handle WebRTC signaling: offer, answer, ice-candidate
     socket.on('offer', (payload) => {
-        io.to(payload.target).emit('offer', payload);
+        io.to(payload.target).emit('offer', { sdp: payload.sdp, caller: socket.id });
     });
 
     socket.on('answer', (payload) => {
-        io.to(payload.target).emit('answer', payload);
+        io.to(payload.target).emit('answer', { sdp: payload.sdp });
     });
 
     socket.on('ice-candidate', (payload) => {
-        io.to(payload.target).emit('ice-candidate', payload);
+        io.to(payload.target).emit('ice-candidate', { candidate: payload.candidate });
     });
 
     // Relay caption data to the other user in the room
     socket.on('send-caption', (captionData) => {
-        socket.to(socket.data.room).emit('new-caption', captionData);
+        const roomId = socket.data.roomId;
+        const otherUser = rooms[roomId]?.find(id => id !== socket.id);
+        if (otherUser) {
+            socket.to(otherUser).emit('new-caption', captionData);
+        }
+    });
+    
+    // Handle call ending
+    socket.on('end-call', () => {
+        handleDisconnect(socket);
     });
 
     // Handle user disconnection
     socket.on('disconnect', () => {
-        console.log('User disconnected:', socket.id);
-        const room = socket.data.room;
-        if (room && roomUsers[room]) {
-            // Remove user from the room
-            roomUsers[room] = roomUsers[room].filter(user => user.id !== socket.id);
-            // If room is empty, clear it
-            if (roomUsers[room].length === 0) {
-                delete roomUsers[room];
-            }
-        }
-        socket.to(room).emit('user-left', socket.id);
+        handleDisconnect(socket);
     });
 });
+
+function handleDisconnect(socket) {
+    console.log('User disconnected:', socket.id);
+    const roomId = socket.data.roomId;
+    if (roomId && rooms[roomId]) {
+        // Notify the other user
+        const otherUser = rooms[roomId].find(id => id !== socket.id);
+        if (otherUser) {
+            io.to(otherUser).emit('user-left');
+        }
+        // Remove user from the room
+        rooms[roomId] = rooms[roomId].filter(id => id !== socket.id);
+        if (rooms[roomId].length === 0) {
+            delete rooms[roomId];
+        }
+    }
+}
+
 
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
